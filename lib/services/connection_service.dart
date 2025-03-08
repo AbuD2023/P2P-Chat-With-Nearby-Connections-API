@@ -215,7 +215,7 @@ class ConnectionService extends ChangeNotifier {
         Permission.bluetoothAdvertise,
         Permission.storage,
         Permission.microphone,
-        Permission.manageExternalStorage,
+        // Permission.manageExternalStorage,
       ].request();
 
       // Check essential permissions
