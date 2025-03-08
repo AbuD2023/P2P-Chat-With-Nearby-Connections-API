@@ -335,21 +335,24 @@ class _MessageBubbleState extends State<_MessageBubble> {
                 ),
               );
             },
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Image.file(
-                file,
-                fit: BoxFit.cover,
-                width: 200,
-                height: 200,
-                errorBuilder: (context, error, stackTrace) {
-                  return Container(
-                    width: 200,
-                    height: 200,
-                    color: Colors.grey[300],
-                    child: Icon(Icons.error),
-                  );
-                },
+            child: Hero(
+              tag: widget.message.filePath!,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.file(
+                  file,
+                  fit: BoxFit.cover,
+                  width: 200,
+                  height: 200,
+                  errorBuilder: (context, error, stackTrace) {
+                    return Container(
+                      width: 200,
+                      height: 200,
+                      color: Colors.grey[300],
+                      child: Icon(Icons.error),
+                    );
+                  },
+                ),
               ),
             ),
           ),

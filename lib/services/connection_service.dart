@@ -442,7 +442,8 @@ class ConnectionService extends ChangeNotifier {
   void _onConnectionInitiated(String id, ConnectionInfo info) async {
     log('Connection initiated with: $id');
     try {
-      Map<String, List<int>> fileBuffers = {};
+      // تهيئة المجلدات قبل استقبال الملفات
+      await _initializeDirectories();
 
       await _nearby.acceptConnection(
         id,
@@ -451,132 +452,353 @@ class ConnectionService extends ChangeNotifier {
           try {
             if (payload.type == PayloadType.BYTES) {
               final bytes = payload.bytes!;
+              String text = utf8.decode(bytes, allowMalformed: true);
+
               try {
-                // محاولة فك الـ JSON للتحقق مما إذا كانت البيانات metadata
-                final String text = utf8.decode(bytes);
                 final Map<String, dynamic> messageData = jsonDecode(text);
+                log('Received message data: $messageData');
 
                 if (messageData['isFile'] == true) {
-                  log('Received file metadata');
+                  // معالجة metadata الملف
                   final String fileName = messageData['fileName'];
                   final String? mimeType = messageData['mimeType'];
+                  final int? fileSize = messageData['fileSize'];
                   final String mediaType = _getMediaType(mimeType);
-
-                  // إنشاء المجلد إذا لم يكن موجوداً
                   final mediaDir = await _getMediaDirectory(mediaType);
-                  if (!await Directory(mediaDir).exists()) {
-                    await Directory(mediaDir).create(recursive: true);
-                  }
 
+                  // إنشاء المسار النهائي للملف
                   final String finalPath =
                       path.join(mediaDir, 'received_$fileName');
-                  log('File will be saved to: $finalPath');
 
-                  // تهيئة buffer للملف
-                  fileBuffers[fileName] = [];
+                  // التأكد من وجود المجلد وإنشائه إذا لم يكن موجوداً
+                  final directory = Directory(mediaDir);
+                  if (!await directory.exists()) {
+                    await directory.create(recursive: true);
+                  }
 
-                  // إضافة رسالة مؤقتة
-                  messages.add(Message(
-                    senderId: messageData['senderId'] ?? endId,
-                    content: 'جاري استلام الملف...',
+                  // تحديد نوع المحتوى المبدئي للرسالة
+                  String initialContent;
+                  if (mimeType?.startsWith('video/') == true) {
+                    initialContent = 'جاري استلام الفيديو... (0%)';
+                  } else if (mimeType?.startsWith('audio/') == true) {
+                    initialContent = 'جاري استلام المقطع الصوتي... (0%)';
+                  } else {
+                    initialContent = 'جاري استلام الملف... (0%)';
+                  }
+
+                  // إضافة رسالة مؤقتة للملف
+                  final message = Message(
+                    senderId: endId,
+                    content: initialContent,
                     timestamp: DateTime.now(),
                     isFromMe: false,
                     isFile: true,
                     fileName: fileName,
-                    filePath: finalPath,
+                    filePath: null, // لا نضع المسار حتى يكتمل الحفظ
                     mimeType: mimeType,
                     transferProgress: 0,
-                  ));
+                    fileSize: fileSize,
+                  );
+
+                  messages.add(message);
+                  deviceMessages[endId] = deviceMessages[endId] ?? [];
+                  deviceMessages[endId]!.add(message);
 
                   notifyListeners();
                   await saveMessages();
+                  await saveDeviceMessages(endId);
+                  log('Added file message: $fileName');
+                } else {
+                  // معالجة الرسالة النصية
+                  final message = Message(
+                    senderId: endId,
+                    content: messageData['content'],
+                    timestamp: DateTime.parse(messageData['timestamp']),
+                    isFromMe: false,
+                    isFile: false,
+                  );
+
+                  messages.add(message);
+                  deviceMessages[endId] = deviceMessages[endId] ?? [];
+                  deviceMessages[endId]!.add(message);
+
+                  notifyListeners();
+                  await saveMessages();
+                  await saveDeviceMessages(endId);
+                  log('Added text message: ${message.content}');
                 }
               } catch (e) {
-                // إذا لم نتمكن من فك الـ JSON، فهذه بيانات الملف
+                // إذا فشل فك الـ JSON، فهذه بيانات الملف
+                log('Processing file bytes');
+
+                // البحث عن آخر رسالة ملف في انتظار البيانات
                 final pendingMessage = messages.lastWhere(
                   (m) =>
                       m.isFile &&
-                      m.content == 'جاري استلام الملف...' &&
+                      (m.content.startsWith('جاري استلام الفيديو') ||
+                          m.content.startsWith('جاري استلام المقطع الصوتي') ||
+                          m.content.startsWith('جاري استلام الملف')) &&
                       !m.isFromMe,
-                  orElse: () =>
-                      throw Exception('No pending file message found'),
+                  orElse: () => Message(
+                    senderId: endId,
+                    content: 'ملف مجهول',
+                    timestamp: DateTime.now(),
+                    isFromMe: false,
+                    isFile: true,
+                    fileName: 'unknown_file',
+                    filePath: null,
+                    mimeType: null,
+                  ),
                 );
 
                 if (pendingMessage.fileName != null) {
-                  fileBuffers[pendingMessage.fileName]?.addAll(bytes);
-                }
-              }
-            }
-          } catch (e) {
-            log('Error in onPayLoadRecieved: $e');
-          }
-        },
-        onPayloadTransferUpdate: (endId, update) async {
-          try {
-            log('Payload transfer update - ID: ${update.id}, Status: ${update.status}, Bytes: ${update.bytesTransferred}/${update.totalBytes}');
+                  // إنشاء مسار مؤقت للملف
+                  final tempFileName =
+                      'temp_${DateTime.now().millisecondsSinceEpoch}_${pendingMessage.fileName}';
+                  final mediaType = _getMediaType(pendingMessage.mimeType);
+                  final mediaDir = await _getMediaDirectory(mediaType);
+                  final tempFile = File(path.join(mediaDir, tempFileName));
 
-            if (update.status == PayloadStatus.SUCCESS) {
-              final pendingMessage = messages.lastWhere(
-                (m) =>
-                    m.isFile &&
-                    m.content == 'جاري استلام الملف...' &&
-                    !m.isFromMe,
-                orElse: () => throw Exception('No pending file message found'),
-              );
-
-              if (pendingMessage.fileName != null &&
-                  pendingMessage.filePath != null) {
-                final fileBytes = fileBuffers[pendingMessage.fileName];
-                if (fileBytes != null) {
-                  final file = File(pendingMessage.filePath!);
-                  await file.writeAsBytes(fileBytes);
-                  log('File saved successfully to: ${pendingMessage.filePath}');
-
-                  // تحديث محتوى الرسالة
-                  final index = messages.indexOf(pendingMessage);
-                  if (index != -1) {
-                    String content;
-                    if (pendingMessage.mimeType?.startsWith('image/') == true) {
-                      content = 'صورة';
-                    } else if (pendingMessage.mimeType?.startsWith('video/') ==
-                        true) {
-                      content = 'فيديو';
-                    } else if (pendingMessage.mimeType?.startsWith('audio/') ==
-                        true) {
-                      content = 'رسالة صوتية';
-                    } else {
-                      content = 'ملف: ${pendingMessage.fileName}';
+                  try {
+                    // التأكد من وجود المجلد
+                    final directory = tempFile.parent;
+                    if (!await directory.exists()) {
+                      await directory.create(recursive: true);
                     }
 
-                    messages[index] = Message(
-                      senderId: pendingMessage.senderId,
-                      content: content,
-                      timestamp: pendingMessage.timestamp,
-                      isFromMe: false,
-                      isFile: true,
-                      fileName: pendingMessage.fileName,
-                      filePath: pendingMessage.filePath,
-                      mimeType: pendingMessage.mimeType,
-                      transferProgress: 1.0,
+                    // حفظ الملف في المسار المؤقت
+                    await tempFile.writeAsBytes(bytes);
+                    log('File saved temporarily to: ${tempFile.path}');
+
+                    // التحقق من وجود الملف وحجمه
+                    if (await tempFile.exists()) {
+                      final fileSize = await tempFile.length();
+                      log('File exists after saving. Size: $fileSize bytes');
+
+                      // التحقق من حجم الملف المتوقع
+                      if (pendingMessage.fileSize != null &&
+                          fileSize != pendingMessage.fileSize) {
+                        throw FileSystemException(
+                            'File size mismatch. Expected: ${pendingMessage.fileSize}, Got: $fileSize');
+                      }
+
+                      // نقل الملف إلى المسار النهائي
+                      final finalFile = File(path.join(
+                          mediaDir, 'received_${pendingMessage.fileName}'));
+                      await tempFile.rename(finalFile.path);
+                      log('File moved to final location: ${finalFile.path}');
+
+                      // تحديث رسالة الملف
+                      final index = messages.indexWhere(
+                        (m) =>
+                            m.isFile &&
+                            m.fileName == pendingMessage.fileName &&
+                            !m.isFromMe,
+                      );
+
+                      if (index != -1) {
+                        final message = messages[index];
+                        String content;
+                        String filePath = finalFile.path;
+
+                        // التأكد من وجود الملف
+                        if (!await finalFile.exists()) {
+                          throw FileSystemException(
+                              'الملف غير موجود في المسار النهائي');
+                        }
+
+                        if (message.mimeType?.startsWith('video/') == true) {
+                          content = 'فيديو';
+                          log('تم حفظ الفيديو في: $filePath');
+                        } else if (message.mimeType?.startsWith('audio/') ==
+                            true) {
+                          content = 'رسالة صوتية';
+                          log('تم حفظ المقطع الصوتي في: $filePath');
+                        } else {
+                          content = 'ملف: ${message.fileName}';
+                          log('تم حفظ الملف في: $filePath');
+                        }
+
+                        messages[index] = Message(
+                          senderId: message.senderId,
+                          content: content,
+                          timestamp: message.timestamp,
+                          isFromMe: false,
+                          isFile: true,
+                          fileName: message.fileName,
+                          filePath: filePath,
+                          mimeType: message.mimeType,
+                          transferProgress: 1.0,
+                          fileSize: fileSize,
+                        );
+
+                        // تحديث رسائل الجهاز
+                        final deviceIndex = deviceMessages[endId]?.indexWhere(
+                          (m) =>
+                              m.isFile && m.fileName == pendingMessage.fileName,
+                        );
+
+                        if (deviceIndex != null && deviceIndex != -1) {
+                          deviceMessages[endId]![deviceIndex] = messages[index];
+                        }
+
+                        notifyListeners();
+                        await saveMessages();
+                        await saveDeviceMessages(endId);
+                        log('Updated file message with final path: $filePath');
+                      }
+                    } else {
+                      throw FileSystemException(
+                          'File does not exist after saving');
+                    }
+                  } catch (e) {
+                    log('Error saving file: $e');
+                    // حذف الملف المؤقت في حالة الفشل
+                    if (await tempFile.exists()) {
+                      await tempFile.delete();
+                    }
+                    // تحديث الرسالة لتعكس فشل الحفظ
+                    final index = messages.indexWhere(
+                      (m) =>
+                          m.isFile &&
+                          m.fileName == pendingMessage.fileName &&
+                          !m.isFromMe,
                     );
-
-                    // تنظيف الـ buffer
-                    fileBuffers.remove(pendingMessage.fileName);
-
-                    notifyListeners();
-                    await saveMessages();
-                    log('Message updated successfully');
+                    if (index != -1) {
+                      messages[index] = Message(
+                        senderId: messages[index].senderId,
+                        content: 'فشل في حفظ الملف',
+                        timestamp: messages[index].timestamp,
+                        isFromMe: false,
+                        isFile: true,
+                        fileName: messages[index].fileName,
+                        filePath: null,
+                        mimeType: messages[index].mimeType,
+                        transferProgress: 0,
+                      );
+                      notifyListeners();
+                    }
                   }
                 }
               }
             }
           } catch (e) {
-            log('Error in transfer update: $e');
+            log('Error processing payload: $e');
+          }
+        },
+        onPayloadTransferUpdate: (endId, update) async {
+          try {
+            log('Transfer update - ID: ${update.id}, Status: ${update.status}, Progress: ${update.bytesTransferred}/${update.totalBytes}');
+
+            if (update.status == PayloadStatus.IN_PROGRESS ||
+                update.status == PayloadStatus.SUCCESS) {
+              final pendingMessage = messages.lastWhere(
+                (m) =>
+                    m.isFile &&
+                    (m.content.startsWith('جاري استلام الفيديو') ||
+                        m.content.startsWith('جاري استلام المقطع الصوتي') ||
+                        m.content.startsWith('جاري استلام الملف')) &&
+                    !m.isFromMe,
+                orElse: () => Message(
+                  senderId: endId,
+                  content: 'ملف مجهول',
+                  timestamp: DateTime.now(),
+                  isFromMe: false,
+                  isFile: true,
+                  fileName: 'unknown_file',
+                  filePath: null,
+                  mimeType: null,
+                ),
+              );
+
+              if (pendingMessage.fileName != null) {
+                final progress = update.bytesTransferred / update.totalBytes;
+                fileTransferProgress[pendingMessage.fileName!] = progress;
+
+                // تحديث رسالة التقدم
+                final index = messages.indexWhere(
+                  (m) =>
+                      m.isFile &&
+                      m.fileName == pendingMessage.fileName &&
+                      !m.isFromMe,
+                );
+
+                if (index != -1) {
+                  final message = messages[index];
+                  String content;
+                  String? filePath;
+
+                  if (update.status == PayloadStatus.SUCCESS) {
+                    // عند اكتمال النقل، تحديث المحتوى والمسار
+                    final mediaType = _getMediaType(message.mimeType);
+                    final mediaDir = await _getMediaDirectory(mediaType);
+                    filePath =
+                        path.join(mediaDir, 'received_${message.fileName}');
+
+                    if (message.mimeType?.startsWith('video/') == true) {
+                      content = 'فيديو';
+                      log('اكتمل استلام الفيديو: $filePath');
+                    } else if (message.mimeType?.startsWith('audio/') == true) {
+                      content = 'رسالة صوتية';
+                      log('اكتمل استلام المقطع الصوتي: $filePath');
+                    } else {
+                      content = 'ملف: ${message.fileName}';
+                      log('اكتمل استلام الملف: $filePath');
+                    }
+                  } else {
+                    // أثناء النقل، عرض نسبة التقدم
+                    if (message.mimeType?.startsWith('video/') == true) {
+                      content =
+                          'جاري استلام الفيديو... (${(progress * 100).toInt()}%)';
+                    } else if (message.mimeType?.startsWith('audio/') == true) {
+                      content =
+                          'جاري استلام المقطع الصوتي... (${(progress * 100).toInt()}%)';
+                    } else {
+                      content =
+                          'جاري استلام الملف... (${(progress * 100).toInt()}%)';
+                    }
+                  }
+
+                  messages[index] = Message(
+                    senderId: message.senderId,
+                    content: content,
+                    timestamp: message.timestamp,
+                    isFromMe: false,
+                    isFile: true,
+                    fileName: message.fileName,
+                    filePath: filePath,
+                    mimeType: message.mimeType,
+                    transferProgress: progress,
+                    fileSize: message.fileSize,
+                  );
+
+                  // تحديث رسائل الجهاز
+                  final deviceIndex = deviceMessages[endId]?.indexWhere(
+                    (m) => m.isFile && m.fileName == pendingMessage.fileName,
+                  );
+
+                  if (deviceIndex != null && deviceIndex != -1) {
+                    deviceMessages[endId]![deviceIndex] = messages[index];
+                  }
+
+                  notifyListeners();
+                  await saveMessages();
+                  await saveDeviceMessages(endId);
+
+                  if (update.status == PayloadStatus.SUCCESS) {
+                    log('تم تحديث حالة الملف بنجاح: ${message.fileName}');
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            log('Error updating transfer progress: $e');
           }
         },
       );
+      log('Connection accepted');
     } catch (e) {
-      log('Error accepting connection: $e');
+      log('Error in connection initialization: $e');
     }
   }
 
@@ -703,6 +925,15 @@ class ConnectionService extends ChangeNotifier {
 
       if (result != null) {
         final String originalPath = result.files.single.path!;
+        final int fileSize = await File(originalPath).length();
+
+        // التحقق من حجم الملف (1GB = 1024 * 1024 * 1024 bytes)
+        if (fileSize > 1024 * 1024 * 1024) {
+          log('File size exceeds limit: ${(fileSize / (1024 * 1024)).toStringAsFixed(2)}MB');
+          throw Exception(
+              'حجم الملف كبير جداً. الحد الأقصى المسموح به هو 1 جيجابايت');
+        }
+
         log('Selected file path: $originalPath');
 
         final fileName = path.basename(originalPath);
@@ -898,6 +1129,7 @@ class Message {
   final String? filePath;
   final String? mimeType;
   final double? transferProgress; // إضافة حقل جديد للتقدم
+  final int? fileSize;
 
   Message({
     required this.senderId,
@@ -909,6 +1141,7 @@ class Message {
     this.filePath,
     this.mimeType,
     this.transferProgress,
+    this.fileSize,
   });
 
   Map<String, dynamic> toJson() => {
@@ -920,6 +1153,7 @@ class Message {
         'filePath': filePath,
         'mimeType': mimeType,
         'transferProgress': transferProgress,
+        'fileSize': fileSize,
       };
 
   factory Message.fromJson(Map<String, dynamic> json) => Message(
@@ -934,5 +1168,6 @@ class Message {
         filePath: json['filePath'],
         mimeType: json['mimeType'],
         transferProgress: json['transferProgress'],
+        fileSize: json['fileSize'],
       );
 }
